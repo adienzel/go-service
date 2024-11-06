@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"math/rand"
 	"strconv"
 	"sync"
@@ -12,6 +11,8 @@ import (
 	"flag"
 
 	"github.com/valyala/fasthttp"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 )
 
 // Configuration values
@@ -20,16 +21,35 @@ var (
 	numClients        int
 	messagesPerSecond float64
 	version           string
+	loglevel          string
 )
+
+var Logger *zap.SugaredLogger
 
 const min int = 10000000
 const max int = 99999999
+
+func getLevelLogger(loglevel string) zapcore.Level {
+	switch {
+	case loglevel == "debug":
+		return zap.DebugLevel
+	case loglevel == "info":
+		return zap.InfoLevel
+	case loglevel == "warning":
+		return zap.WarnLevel
+	case loglevel == "error":
+		return zap.ErrorLevel
+	default:
+		return zap.DebugLevel
+	}
+}
 
 func init() {
 	// CLI flags for the application
 	flag.StringVar(&serverAddress, "server", "http://localhost:8080", "Server address and port")
 	flag.IntVar(&numClients, "clients", 1, "Number of WebSocket clients")
 	flag.Float64Var(&messagesPerSecond, "rate", 1.0, "Rate of messages per second (float)")
+	flag.StringVar(&loglevel, "Loglevel", "debug", "Loglevel can be  [error, warning, info, debug] defasult is debug")
 	flag.StringVar(&version, "version", "v1", "Version of the request")
 	flag.Parse()
 }
@@ -51,7 +71,7 @@ type ResponseBody struct {
 }
 
 // Function to send a POST request with the version, VIN, and command using fasthttp
-func sendRequest(clientID int, wg *sync.WaitGroup) {
+func sendRequest(clientID int, wg *sync.WaitGroup, logger *zap.SugaredLogger) {
 	defer wg.Done()
 
 	rand.New(rand.NewSource(int64(clientID))) // maintain the same client id and it will be the same between stoping and stating app
@@ -65,16 +85,15 @@ func sendRequest(clientID int, wg *sync.WaitGroup) {
 		<-ticker.C
 
 		// Generate version, VIN, and command for the request
-		v := "v1.0"
 
-		url := fmt.Sprintf("%s/%s/%d/%s", serverAddress, v, vin, "openDoor")
+		url := fmt.Sprintf("%s/%s/%d/%s", serverAddress, version, vin, "openDoor")
 
 		// Create timestamp for the request
 		timestamp := time.Now()
 
 		// Prepare the request body as JSON, including the timestamp
 		body := RequestBody{
-			Version:     v,
+			Version:     version,
 			VIN:         strconv.FormatInt(int64(vin), 10),
 			Command:     "openDoor",
 			Seconds:     int64(timestamp.Second()),
@@ -82,7 +101,7 @@ func sendRequest(clientID int, wg *sync.WaitGroup) {
 		}
 		jsonBody, err := json.Marshal(body)
 		if err != nil {
-			log.Printf("Client %d: Error marshalling JSON: %v", clientID, err)
+			logger.Errorf("Client %d: Error marshalling JSON: %v", clientID, err)
 			return
 		}
 
@@ -98,19 +117,19 @@ func sendRequest(clientID int, wg *sync.WaitGroup) {
 		// Send the request
 		err = client.Do(req, resp)
 		if err != nil {
-			log.Printf("Client %d: Error sending request: %v", clientID, err)
+			logger.Errorf("Client %d: Error sending request: %v", clientID, err)
 			return
 		}
 
 		// Parse the response body
 		var responseBody ResponseBody
 		if err := json.Unmarshal(resp.Body(), &responseBody); err != nil {
-			log.Printf("Client %d: Error unmarshalling response: %v", clientID, err)
+			logger.Errorf("Client %d: Error unmarshalling response: %v", clientID, err)
 			return
 		}
 
 		// Log the server response
-		log.Printf("Client %d: Sent request to %s, received status %d, timestamp %d.%d", clientID, url, resp.StatusCode(), responseBody.Seconds, responseBody.Nanoseconds)
+		logger.Infof("Client %d: Sent request to %s, received status %d, timestamp %d.%d", clientID, url, resp.StatusCode(), responseBody.Seconds, responseBody.Nanoseconds)
 	}
 }
 
@@ -124,13 +143,14 @@ func externalRequestHandler(ctx *fasthttp.RequestCtx) {
 	// Read the JSON body
 	var requestBody RequestBody
 	if err := json.Unmarshal(ctx.PostBody(), &requestBody); err != nil {
+		Logger.Errorf("Invalid JSON body, ")
 		ctx.Error("Invalid JSON body", fasthttp.StatusBadRequest)
 		return
 	}
 
 	// Log received request
-	log.Printf("Received request: version=%s, VIN=%s, command=%s, timestamp=%d.%d", version, vins, command, requestBody.Seconds, requestBody.Nanoseconds)
-	log.Printf("Received JSON body: %+v", requestBody)
+	Logger.Infof("Received request: version=%s, VIN=%s, command=%s, timestamp=%d.%d", version, vins, command, requestBody.Seconds, requestBody.Nanoseconds)
+	Logger.Infof("Received JSON body: %+v", requestBody)
 
 	// Add a timestamp to the response body (the server's processing time)
 	timestamp := time.Now()
@@ -154,20 +174,35 @@ func startExternalServer() {
 }
 
 func main() {
-	// Initialize random number generator
-	rand.Seed(time.Now().UnixNano())
+	var err error
+	level := zap.NewAtomicLevelAt(getLevelLogger(loglevel))
+	encoder := zap.NewProductionEncoderConfig()
 
+	zapConfig := zap.NewProductionConfig()
+	zapConfig.EncoderConfig = encoder
+	zapConfig.Level = level
+	// zapConfig.Development = config.IS_DEVELOP_MODE
+	zapConfig.Encoding = "json"
+	//zapConfig.InitialFields = map[string]interface{}{"idtx": "999"}
+	zapConfig.OutputPaths = []string{"stdout"} // can add later a log file
+	zapConfig.ErrorOutputPaths = []string{"stderr"}
+	logger, err := zapConfig.Build()
+
+	if err != nil {
+		panic(err)
+	}
+	Logger = logger.Sugar()
 	// Start the external HTTP server in a separate Goroutine
 	go startExternalServer()
 
-	log.Printf("Starting client application: Server=%s, Clients=%d, Rate=%.2f msgs/sec", serverAddress, numClients, messagesPerSecond)
+	Logger.Infof("Starting client application: Server=%s, Clients=%d, Rate=%.2f msgs/sec", serverAddress, numClients, messagesPerSecond)
 
 	var wg sync.WaitGroup
 
 	// Start multiple clients concurrently
 	for i := 0; i < numClients; i++ {
 		wg.Add(1)
-		go sendRequest(i+1, &wg)
+		go sendRequest(i+1, &wg, Logger)
 	}
 
 	// Wait for all clients to finish
