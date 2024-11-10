@@ -4,30 +4,72 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/rand"
+	"os"
 	"strconv"
 	"sync"
 	"time"
 
-	"flag"
-
+	"github.com/gocql/gocql"
 	"github.com/valyala/fasthttp"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 )
 
 // Configuration values
+type ScyllaConfig struct { // get from env or CLI
+	ScyllaDBAddress   string `json:"scyllaDBAddress"`
+	KeySpaceName      string `json:"keySpaceName"`
+	ReplicationFactor string `json:"replicationFactor"`
+	Stategy           string `json:"stategy"`
+	TableName         string `json:"tableName"`
+}
+
 var (
 	serverAddress     string
 	numClients        int
 	messagesPerSecond float64
 	version           string
 	loglevel          string
+	session           *gocql.Session
+	scyllaConfig      ScyllaConfig
 )
 
 var Logger *zap.SugaredLogger
 
 const min int = 10000000
 const max int = 99999999
+
+func lookupEnvString(env string, defaultParam string) string {
+	param, found := os.LookupEnv(env)
+	if !found {
+		param = defaultParam
+	}
+	return param
+}
+
+func lookupEnvint64(env string, defaultParam int64) int64 {
+	param, found := os.LookupEnv(env)
+	if !found {
+		param = strconv.FormatInt(int64(defaultParam), 10)
+	}
+	i, err := strconv.ParseInt(param, 10, 64)
+	if err != nil {
+		i = 1
+	}
+	return i
+}
+
+func lookupEnvFloat64(env string, defaultParam float64) float64 {
+	param, found := os.LookupEnv(env)
+	if !found {
+		param = fmt.Sprintf("%f", defaultParam)
+	}
+	i, err := strconv.ParseFloat(param, 64)
+	if err != nil {
+		i = 1
+	}
+	return i
+}
 
 func getLevelLogger(loglevel string) zapcore.Level {
 	switch {
@@ -45,13 +87,78 @@ func getLevelLogger(loglevel string) zapcore.Level {
 }
 
 func init() {
-	// CLI flags for the application
-	flag.StringVar(&serverAddress, "server", "http://localhost:8080", "Server address and port")
-	flag.IntVar(&numClients, "clients", 1, "Number of WebSocket clients")
-	flag.Float64Var(&messagesPerSecond, "rate", 1.0, "Rate of messages per second (float)")
-	flag.StringVar(&loglevel, "Loglevel", "debug", "Loglevel can be  [error, warning, info, debug] defasult is debug")
-	flag.StringVar(&version, "version", "v1", "Version of the request")
-	flag.Parse()
+	server := lookupEnvString("SERVICE_HOST_ADDRES", "127.0.0.1")
+	port := lookupEnvString("SERVICE_HOST_PORT", "8992")
+	serverAddress = server + ":" + port
+
+	numClients = int(lookupEnvint64("SERVICE_NUMBER_OF_CLIENTS", 1))
+	messagesPerSecond = lookupEnvFloat64("SERVICE_MESAGES_PER_SECOND", 1.0)
+	loglevel = lookupEnvString("SERVICE_LOGLEVEL", "debug")
+	version = lookupEnvString("SERVICE_VERSION", "V1.0")
+	scyllaConfig.ScyllaDBAddress = lookupEnvString("SERVICE_SCYLLA_DB_ADDRESS", "127.0.0.1") + ":"
+	scyllaConfig.ScyllaDBAddress += lookupEnvString("SERVICE_SCYLLADB_PORT", "9060")
+	scyllaConfig.KeySpaceName = lookupEnvString("SERVICE_SCYLLADB_KEYSPACE_NAME", "vin")
+	scyllaConfig.ReplicationFactor = lookupEnvString("SERVICE_SCYLLADB_REPLICATION_FACTOR", "1")
+	scyllaConfig.Stategy = lookupEnvString("SERVICE_SCYLLADB_STRATEGY", "SimpleStrategy")
+	scyllaConfig.TableName = lookupEnvString("SERVICE_SCYLLADB_TABLE_NAME", "vehicles")
+}
+
+func (c *ScyllaConfig) createKeyspace() bool {
+	q := "CREATE KEYSPACE IF NOT EXISTS " + c.KeySpaceName + " WITH replication = { 'class': '" + c.Stategy +
+		"' , 'replication_factor': " + c.ReplicationFactor + "};"
+	if err := session.Query(q).Exec(); err != nil {
+		Logger.Errorf("failed to execute query", err)
+		return false
+	}
+	return true
+
+}
+
+func (c *ScyllaConfig) createTable() bool {
+	q := "CREATE TABLE IF NOT EXISTS" + c.KeySpaceName + "." + c.TableName + " (vin text PRIMARY KEY, host text);"
+	if err := session.Query(q).Exec(); err != nil {
+		Logger.Errorf("failed to execute query", err)
+		return false
+	}
+	return true
+}
+
+func (c *ScyllaConfig) createMatiriaizedView() bool {
+	q := "CREATE MATERIALIZED VIEW IF NOT EXISTS " + c.KeySpaceName + "." + c.TableName +
+		"_by_host AS SELECT host, vin FROM " + c.KeySpaceName + "." + c.TableName +
+		" WHERE host IS NOT NULL AND vin IS NOT NULL PRIMARY KEY (host, vin);"
+
+	if err := session.Query(q).Exec(); err != nil {
+		Logger.Errorf("failed to execute query", err)
+		return false
+	}
+
+	return true
+}
+
+func initSession(c *ScyllaConfig) bool {
+	cluster := gocql.NewCluster(c.ScyllaDBAddress)
+
+	var err error
+	session, err = cluster.CreateSession()
+	if err != nil {
+		Logger.Errorf("failed to connect ScyllaDB", err)
+		return false
+	}
+
+	res := c.createKeyspace()
+	if !res {
+		return res
+	}
+
+	res = c.createTable()
+	if !res {
+		return res
+	}
+
+	res = c.createMatiriaizedView()
+
+	return res
 }
 
 // Request structure to be sent in both URL and JSON body
@@ -170,11 +277,10 @@ func externalRequestHandler(ctx *fasthttp.RequestCtx) {
 // Start the external HTTP server to handle incoming requests using fasthttp
 func startExternalServer() {
 	// Use fasthttp request handler
-	fasthttp.ListenAndServe(":8081", externalRequestHandler)
+	fasthttp.ListenAndServe(":9080", externalRequestHandler)
 }
 
 func main() {
-	var err error
 	level := zap.NewAtomicLevelAt(getLevelLogger(loglevel))
 	encoder := zap.NewProductionEncoderConfig()
 
@@ -191,7 +297,15 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
+
 	Logger = logger.Sugar()
+
+	//TODO build all configuration for the scylla servers
+	scyllaConfig := ScyllaConfig{}
+
+	if !initSession(&scyllaConfig) {
+
+	}
 	// Start the external HTTP server in a separate Goroutine
 	go startExternalServer()
 
