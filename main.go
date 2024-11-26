@@ -24,8 +24,26 @@ type ScyllaConfig struct { // get from env or CLI
 	TableName         string `json:"tableName"`
 }
 
+type json_message struct {
+	Version            string `json:"version" validate:"required"`
+	Message_type       string `json:"MessageType" validate:"required"`
+	Command            string `json:"command" validate:"required"`
+	Counter            uint64 `json:"MessageNumber" validate:"required"`
+	StartTime_seconds  uint64 `json:"StartTimeSeconds" validate:"required"`
+	StartTime_nanosec  uint64 `json:"StartTimeNano" validate:"required"`
+	RcvTime_seconds    uint64 `json:"RcvTimeSeconds"`
+	RcvTime_nanosec    uint64 `json:"RcvTimeNano"`
+	Ws_Up_seconds      uint64 `json:"WsUpSeconds"`
+    Ws_Up_nanosec      uint64 `json:"WsUpNano"`
+	Ws_Dn_seconds      uint64 `json:"WsDnSeconds"`
+    Ws_Dn_nanosec      uint64 `json:"WsDnNano"`
+	Vin                string `json:"VIN" validate:"required"`
+	Msg                string `json:"msg"` 
+}
+
 var (
 	serverAddress     string
+	listeningPort     string
 	numClients        int
 	messagesPerSecond float64
 	version           string
@@ -87,9 +105,10 @@ func getLevelLogger(loglevel string) zapcore.Level {
 }
 
 func init() {
-	server := lookupEnvString("SERVICE_HOST_ADDRES", "127.0.0.1")
-	port := lookupEnvString("SERVICE_HOST_PORT", "8992")
+	server := lookupEnvString("SERVICE_REQUEST_HOST_ADDRES", "127.0.0.1")
+	port := lookupEnvString("SERVICE_REQUEST_PORT", "8992")
 	serverAddress = server + ":" + port
+	listeningPort = lookupEnvString("SERVICE_LISTENING_PORT", "8992")
 
 	numClients = int(lookupEnvint64("SERVICE_NUMBER_OF_CLIENTS", 1))
 	messagesPerSecond = lookupEnvFloat64("SERVICE_MESAGES_PER_SECOND", 1.0)
@@ -161,22 +180,6 @@ func initSession(c *ScyllaConfig) bool {
 	return res
 }
 
-// Request structure to be sent in both URL and JSON body
-type RequestBody struct {
-	Version     string `json:"version"`
-	VIN         string `json:"VIN"`
-	Command     string `json:"command"`
-	Seconds     int64  `json:"seconds"`
-	Nanoseconds int64  `json:"nanoseconds"`
-}
-
-type ResponseBody struct {
-	Status      string `json:"status"`
-	Message     string `json:"message"`
-	Seconds     int64  `json:"seconds"`
-	Nanoseconds int64  `json:"nanoseconds"`
-}
-
 // Function to send a POST request with the version, VIN, and command using fasthttp
 func sendRequest(clientID int, wg *sync.WaitGroup, logger *zap.SugaredLogger) {
 	defer wg.Done()
@@ -186,6 +189,7 @@ func sendRequest(clientID int, wg *sync.WaitGroup, logger *zap.SugaredLogger) {
 	client := &fasthttp.Client{}
 	ticker := time.NewTicker(time.Second / time.Duration(messagesPerSecond))
 	defer ticker.Stop()
+	var i uint64 = 0
 
 	for {
 		// Wait for ticker to send requests at defined rate
@@ -199,13 +203,18 @@ func sendRequest(clientID int, wg *sync.WaitGroup, logger *zap.SugaredLogger) {
 		timestamp := time.Now()
 
 		// Prepare the request body as JSON, including the timestamp
-		body := RequestBody{
+		body := json_message{
+			Message_type: "RPC",
+			Counter:     i,
 			Version:     version,
-			VIN:         strconv.FormatInt(int64(vin), 10),
+			Vin:         strconv.FormatInt(int64(vin), 10),
 			Command:     "openDoor",
-			Seconds:     int64(timestamp.Second()),
-			Nanoseconds: int64(timestamp.Nanosecond()),
+			StartTime_seconds: uint64(timestamp.Second()),
+			StartTime_nanosec: uint64(timestamp.Nanosecond()),
+			Msg: "12345678901234567890",
 		}
+
+        i++
 		jsonBody, err := json.Marshal(body)
 		if err != nil {
 			logger.Errorf("Client %d: Error marshalling JSON: %v", clientID, err)
@@ -229,7 +238,7 @@ func sendRequest(clientID int, wg *sync.WaitGroup, logger *zap.SugaredLogger) {
 		}
 
 		// Parse the response body
-		var responseBody ResponseBody
+		var responseBody json_message
 		if err := json.Unmarshal(resp.Body(), &responseBody); err != nil {
 			logger.Errorf("Client %d: Error unmarshalling response: %v", clientID, err)
 			return
@@ -277,7 +286,7 @@ func externalRequestHandler(ctx *fasthttp.RequestCtx) {
 // Start the external HTTP server to handle incoming requests using fasthttp
 func startExternalServer() {
 	// Use fasthttp request handler
-	fasthttp.ListenAndServe(":9080", externalRequestHandler)
+	fasthttp.ListenAndServe(listeningPort, externalRequestHandler)
 }
 
 func main() {
@@ -309,7 +318,10 @@ func main() {
 	// Start the external HTTP server in a separate Goroutine
 	go startExternalServer()
 
-	Logger.Infof("Starting client application: Server=%s, Clients=%d, Rate=%.2f msgs/sec", serverAddress, numClients, messagesPerSecond)
+	Logger.Infof(`Starting client application: Server=%s, Clients=%d, Rate=%.2f msgs/sec`,
+		serverAddress,
+		numClients,
+		messagesPerSecond)
 
 	var wg sync.WaitGroup
 
